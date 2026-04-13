@@ -103,6 +103,46 @@ Environment variables:
 
 ---
 
+
+## 🤖 CI/CD: Build and Publish Docker image
+
+This repo includes a GitHub Actions workflow at `.github/workflows/docker-image.yml` that:
+
+* Builds the container image on every PR to `main` (build only, no push)
+* Builds **and pushes** on pushes to `main`
+* Builds **and pushes** for version tags like `v1.2.3`
+* Publishes to **GitHub Container Registry (GHCR)** as:
+
+```
+ghcr.io/<owner>/<repo>:latest
+ghcr.io/<owner>/<repo>:<branch>
+ghcr.io/<owner>/<repo>:<git-sha>
+```
+
+### Portainer usage
+
+In Portainer, use this image in your stack:
+
+```yaml
+services:
+  hwinfo-exporter:
+    image: ghcr.io/<owner>/<repo>:latest
+    restart: unless-stopped
+    ports:
+      - "10445:10445"
+    environment:
+      HWI_URL: "http://YOUR_WINDOWS_HOST:55555/"
+      EXPORTER_HOST: "your-hostname"
+      LISTEN_HOST: "0.0.0.0"
+      LISTEN_PORT: "10445"
+      POLL_INTERVAL: "1"
+      HTTP_TIMEOUT: "1"
+      DOWN_RETRY_INTERVAL: "2"
+      LOG_LEVEL: "INFO"
+```
+
+> If your GHCR package is private, add registry credentials in Portainer (`ghcr.io`, GitHub username, and a PAT with `read:packages`).
+
 ## 🐳 Docker Usage
 
 Example Dockerfile:
