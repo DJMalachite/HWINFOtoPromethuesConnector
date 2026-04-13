@@ -1,0 +1,32 @@
+name: Docker Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - work
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./dockerfile
+          push: false
+          tags: hwinfo-prom-exporter:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
+"""
+Improved HWiNFO -> Prometheus exporter.
+
+Summary of key behavior changes:
+- Prevents stale sensor values from being exported when source data is too old.
+- Exposes `hwinfo_exporter_up` as real source-connectivity health (not only process health).
+- Adds configurable freshness timeout and structured logging.
+"""
+
 import json
+import logging
 import math
 import os
 import re
@@ -28,6 +38,11 @@ HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "2"))
 DOWN_RETRY_INTERVAL = float(os.getenv("DOWN_RETRY_INTERVAL", "2"))
 REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "1"))
 
+# Freshness timeout is intentionally independent of poll interval.
+# If no successful poll arrives within this window, sensor data is treated as stale
+# and omitted from /metrics so Prometheus does not scrape old values as current.
+DATA_FRESHNESS_TIMEOUT = float(os.getenv("DATA_FRESHNESS_TIMEOUT", "20"))
+
 EXPORTER_HOST = os.getenv("EXPORTER_HOST", socket.gethostname())
 METRIC_PREFIX = os.getenv("METRIC_PREFIX", "hwinfo")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -40,6 +55,16 @@ EXCLUDE_CLASSES = [x.strip().lower() for x in os.getenv("EXCLUDE_CLASSES", "").s
 
 INCLUDE_APPS = [x.strip().lower() for x in os.getenv("INCLUDE_APPS", "").split(",") if x.strip()]
 EXCLUDE_APPS = [x.strip().lower() for x in os.getenv("EXCLUDE_APPS", "").split(",") if x.strip()]
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("hwinfo_exporter")
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -75,9 +100,6 @@ UNIT_NORMALIZATION = {
     "": "none",
 }
 
-def log(msg: str) -> None:
-    if LOG_LEVEL in ("DEBUG", "INFO"):
-        print(msg, flush=True)
 
 def sanitize_name(value: str) -> str:
     value = str(value).strip().lower()
@@ -90,6 +112,7 @@ def sanitize_name(value: str) -> str:
     value = SAFE_NAME_RE.sub("_", value)
     value = MULTI_UNDERSCORE_RE.sub("_", value).strip("_")
     return value or "unknown"
+
 
 def clean_text(value: Any) -> str:
     if value is None:
@@ -109,15 +132,19 @@ def clean_text(value: Any) -> str:
 
     return text.strip()
 
+
 def normalize_unit_raw(unit: Any) -> str:
     return clean_text(unit)
+
 
 def normalize_unit(unit: Any) -> str:
     raw = normalize_unit_raw(unit)
     return UNIT_NORMALIZATION.get(raw, sanitize_name(raw))
 
+
 def safe_label(value: Any) -> str:
     return clean_text(value)
+
 
 def parse_bool_like(text: str) -> Optional[float]:
     lowered = text.strip().lower()
@@ -126,6 +153,7 @@ def parse_bool_like(text: str) -> Optional[float]:
     if lowered in ("no", "false", "off", "disabled"):
         return 0.0
     return None
+
 
 def safe_float(value: Any) -> Optional[float]:
     if value is None:
@@ -156,6 +184,7 @@ def safe_float(value: Any) -> Optional[float]:
         return None
     return val
 
+
 def token_match(value: str, includes: List[str], excludes: List[str]) -> bool:
     lowered = value.lower()
 
@@ -167,6 +196,7 @@ def token_match(value: str, includes: List[str], excludes: List[str]) -> bool:
 
     return True
 
+
 def should_include(sensor_name: str, sensor_class: str, sensor_app: str) -> bool:
     if not token_match(sensor_name, INCLUDE_SENSORS, EXCLUDE_SENSORS):
         return False
@@ -175,6 +205,7 @@ def should_include(sensor_name: str, sensor_class: str, sensor_app: str) -> bool
     if not token_match(sensor_app, INCLUDE_APPS, EXCLUDE_APPS):
         return False
     return True
+
 
 # -----------------------------------------------------------------------------
 # Shared state
@@ -189,11 +220,12 @@ class ExporterState:
         self.last_poll_duration_seconds: float = 0.0
         self.last_error: str = ""
         self.last_http_status: int = 0
-        self.up: int = 0
+        self.source_up: int = 0
         self.successful_polls: int = 0
         self.failed_polls: int = 0
         self.raw_items_last: int = 0
         self.exported_items_last: int = 0
+
 
 state = ExporterState()
 stop_event = threading.Event()
@@ -201,6 +233,7 @@ stop_event = threading.Event()
 # -----------------------------------------------------------------------------
 # Parsing
 # -----------------------------------------------------------------------------
+
 
 def parse_hwinfo_payload(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
     if not isinstance(payload, list):
@@ -228,7 +261,7 @@ def parse_hwinfo_payload(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
             continue
 
         if sensor_value is None:
-            # Skip non-numeric values because Prometheus samples must be numeric
+            # Prometheus samples must be numeric.
             continue
 
         parsed_rows.append(
@@ -243,7 +276,7 @@ def parse_hwinfo_payload(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
             }
         )
 
-    # Add occurrence label when multiple identical label sets appear
+    # Add occurrence label when multiple identical label sets appear.
     key_counts = Counter(
         (
             row["sensor_app"],
@@ -275,9 +308,11 @@ def parse_hwinfo_payload(payload: Any) -> Tuple[List[Dict[str, Any]], int]:
 
     return final_rows, raw_count
 
+
 # -----------------------------------------------------------------------------
 # Polling / reconnect
 # -----------------------------------------------------------------------------
+
 
 def build_session() -> requests.Session:
     s = requests.Session()
@@ -290,7 +325,13 @@ def build_session() -> requests.Session:
     s.mount("https://", adapter)
     return s
 
+
 session = build_session()
+
+
+def _expired(now: float, last_success_ts: float) -> bool:
+    return (last_success_ts <= 0) or ((now - last_success_ts) > DATA_FRESHNESS_TIMEOUT)
+
 
 def poll_once() -> None:
     global session
@@ -309,53 +350,70 @@ def poll_once() -> None:
         payload = json.loads(response.text)
         parsed_rows, raw_count = parse_hwinfo_payload(payload)
 
+        # Empty numeric payload should be considered a source/data failure.
         if not parsed_rows:
             raise RuntimeError("Parsed zero numeric metrics from HWiNFO JSON")
 
+        now = time.time()
         with state.lock:
             state.rows = parsed_rows
-            state.last_success_ts = time.time()
-            state.last_attempt_ts = time.time()
-            state.last_poll_duration_seconds = time.time() - started
+            state.last_success_ts = now
+            state.last_attempt_ts = now
+            state.last_poll_duration_seconds = now - started
             state.last_error = ""
             state.last_http_status = status_code
-            state.up = 1
+            state.source_up = 1
             state.successful_polls += 1
             state.raw_items_last = raw_count
             state.exported_items_last = len(parsed_rows)
 
     except Exception as exc:
+        # Rebuild session for robust recovery after socket/network failures.
         try:
             session.close()
         except Exception:
             pass
         session = build_session()
 
+        now = time.time()
         with state.lock:
-            state.last_attempt_ts = time.time()
-            state.last_poll_duration_seconds = time.time() - started
+            state.last_attempt_ts = now
+            state.last_poll_duration_seconds = now - started
             state.last_error = str(exc)
             state.last_http_status = status_code
-            state.up = 0
+            state.source_up = 0
             state.failed_polls += 1
             state.raw_items_last = raw_count
             state.exported_items_last = len(parsed_rows)
 
-        if LOG_LEVEL in ("DEBUG", "INFO"):
-            print(f"[poll error] {exc}", flush=True)
+            # Key stale-data fix:
+            # If data is beyond freshness timeout, drop cached sensor rows so
+            # they cannot be emitted as fresh samples.
+            if _expired(now, state.last_success_ts):
+                state.rows = []
+
+        logger.warning("Poll failure from %s: %s", HWI_URL, exc)
+
 
 def polling_loop() -> None:
-    log(f"Polling {HWI_URL} every {POLL_INTERVAL}s with timeout {HTTP_TIMEOUT}s")
-    log(f"Fast retry while down: {DOWN_RETRY_INTERVAL}s")
+    logger.info(
+        "Polling %s every %.2fs (timeout %.2fs, freshness_timeout %.2fs)",
+        HWI_URL,
+        POLL_INTERVAL,
+        HTTP_TIMEOUT,
+        DATA_FRESHNESS_TIMEOUT,
+    )
+    logger.info("Fast retry while down: %.2fs", DOWN_RETRY_INTERVAL)
 
     while not stop_event.is_set():
         poll_once()
 
         with state.lock:
-            is_up = bool(state.up)
+            is_up = bool(state.source_up)
 
         wait_time = POLL_INTERVAL if is_up else DOWN_RETRY_INTERVAL
         stop_event.wait(wait_time)
+
 
 # -----------------------------------------------------------------------------
 # Prometheus collector
@@ -367,7 +425,7 @@ class HwinfoCollector:
 
         with state.lock:
             rows_snapshot = list(state.rows)
-            up = state.up
+            source_up = state.source_up
             last_success_ts = state.last_success_ts
             last_attempt_ts = state.last_attempt_ts
             last_poll_duration_seconds = state.last_poll_duration_seconds
@@ -379,11 +437,21 @@ class HwinfoCollector:
 
         now = time.time()
         age_seconds = (now - last_success_ts) if last_success_ts > 0 else 1e30
-        stale = 1 if age_seconds > (POLL_INTERVAL * 2) else 0
+        stale = 1 if _expired(now, last_success_ts) else 0
 
-        # Health metrics
-        g = GaugeMetricFamily(f"{prefix}_exporter_up", "1 if the last HWiNFO poll succeeded, else 0")
-        g.add_metric([], up)
+        # Connectivity metric for Prometheus alerting.
+        # Healthy only if the source is reachable *and* data is fresh.
+        exporter_up_value = 1 if (source_up == 1 and stale == 0) else 0
+
+        g = GaugeMetricFamily(
+            f"{prefix}_exporter_up",
+            "1 if source is reachable and data is fresh, else 0",
+        )
+        g.add_metric([], exporter_up_value)
+        yield g
+
+        g = GaugeMetricFamily(f"{prefix}_exporter_source_up", "1 if last source poll succeeded, else 0")
+        g.add_metric([], source_up)
         yield g
 
         g = GaugeMetricFamily(f"{prefix}_exporter_stale", "1 if cached data is stale")
@@ -394,11 +462,24 @@ class HwinfoCollector:
         g.add_metric([], age_seconds)
         yield g
 
-        g = GaugeMetricFamily(f"{prefix}_exporter_last_success_timestamp_seconds", "Unix timestamp of the last successful poll")
+        g = GaugeMetricFamily(
+            f"{prefix}_exporter_freshness_timeout_seconds",
+            "Configured freshness timeout; data older than this is not exported",
+        )
+        g.add_metric([], DATA_FRESHNESS_TIMEOUT)
+        yield g
+
+        g = GaugeMetricFamily(
+            f"{prefix}_exporter_last_success_timestamp_seconds",
+            "Unix timestamp of the last successful poll",
+        )
         g.add_metric([], last_success_ts if last_success_ts > 0 else 0)
         yield g
 
-        g = GaugeMetricFamily(f"{prefix}_exporter_last_attempt_timestamp_seconds", "Unix timestamp of the last poll attempt")
+        g = GaugeMetricFamily(
+            f"{prefix}_exporter_last_attempt_timestamp_seconds",
+            "Unix timestamp of the last poll attempt",
+        )
         g.add_metric([], last_attempt_ts if last_attempt_ts > 0 else 0)
         yield g
 
@@ -406,27 +487,34 @@ class HwinfoCollector:
         g.add_metric([], last_poll_duration_seconds)
         yield g
 
-        g = GaugeMetricFamily(f"{prefix}_exporter_last_http_status", "Last HTTP status seen from HWiNFO source")
+        g = GaugeMetricFamily(f"{prefix}_exporter_last_http_status", "Last HTTP status from source")
         g.add_metric([], float(last_http_status))
         yield g
 
-        g = GaugeMetricFamily(f"{prefix}_exporter_successful_polls_total", "Total successful HWiNFO polls")
+        g = GaugeMetricFamily(f"{prefix}_exporter_successful_polls_total", "Total successful source polls")
         g.add_metric([], float(successful_polls))
         yield g
 
-        g = GaugeMetricFamily(f"{prefix}_exporter_failed_polls_total", "Total failed HWiNFO polls")
+        g = GaugeMetricFamily(f"{prefix}_exporter_failed_polls_total", "Total failed source polls")
         g.add_metric([], float(failed_polls))
         yield g
 
-        g = GaugeMetricFamily(f"{prefix}_exporter_raw_items_last", "Number of raw items in the last payload")
+        g = GaugeMetricFamily(f"{prefix}_exporter_raw_items_last", "Number of raw items in last source payload")
         g.add_metric([], float(raw_items_last))
         yield g
 
-        g = GaugeMetricFamily(f"{prefix}_exporter_exported_items_last", "Number of exported numeric sensor items in the last payload")
+        g = GaugeMetricFamily(
+            f"{prefix}_exporter_exported_items_last",
+            "Number of exported numeric items in last successful payload",
+        )
         g.add_metric([], float(exported_items_last))
         yield g
 
-        # Sensor metrics
+        # Main stale-data protection at scrape-time:
+        # If stale, do not export sensor series at all.
+        if stale == 1:
+            return
+
         label_keys = [
             "host",
             "sensor_app",
@@ -451,7 +539,7 @@ class HwinfoCollector:
 
         present_family = GaugeMetricFamily(
             f"{prefix}_sensor_present",
-            "1 if the sensor was present in the last successful payload",
+            "1 if sensor was present in the most recent fresh payload",
             labels=label_keys,
         )
 
@@ -474,12 +562,13 @@ class HwinfoCollector:
         yield update_family
         yield present_family
 
+
 # -----------------------------------------------------------------------------
 # HTTP server
 # -----------------------------------------------------------------------------
 
 class RequestHandler(BaseHTTPRequestHandler):
-    server_version = "HWiNFOPromExporter/2.1"
+    server_version = "HWiNFOPromExporter/2.2"
 
     def _send_bytes(self, status: int, content_type: str, body: bytes) -> None:
         self.send_response(status)
@@ -495,20 +584,25 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "name": "hwinfo_prom_exporter",
                     "metrics_path": "/metrics",
                     "health_path": "/healthz",
+                    "ready_path": "/readyz",
                     "hwinfo_url": HWI_URL,
                     "listen": f"{LISTEN_HOST}:{LISTEN_PORT}",
                     "metric_prefix": sanitize_name(METRIC_PREFIX),
+                    "freshness_timeout_seconds": DATA_FRESHNESS_TIMEOUT,
                 },
                 indent=2,
             ).encode("utf-8")
             self._send_bytes(200, "application/json; charset=utf-8", body)
             return
 
-        if self.path == "/healthz":
+        if self.path in ("/healthz", "/readyz"):
             with state.lock:
+                now = time.time()
+                stale = _expired(now, state.last_success_ts)
                 payload = {
-                    "up": bool(state.up),
-                    "stale": bool((time.time() - state.last_success_ts) > (POLL_INTERVAL * 2)) if state.last_success_ts else True,
+                    "source_up": bool(state.source_up),
+                    "exporter_up": bool(state.source_up and not stale),
+                    "stale": stale,
                     "last_success_ts": state.last_success_ts,
                     "last_attempt_ts": state.last_attempt_ts,
                     "last_poll_duration_seconds": state.last_poll_duration_seconds,
@@ -518,9 +612,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "failed_polls": state.failed_polls,
                     "raw_items_last": state.raw_items_last,
                     "exported_items_last": state.exported_items_last,
+                    "data_freshness_timeout_seconds": DATA_FRESHNESS_TIMEOUT,
                 }
 
-            status = 200 if payload["up"] else 503
+            status = 200 if payload["exporter_up"] else 503
             body = json.dumps(payload, indent=2).encode("utf-8")
             self._send_bytes(status, "application/json; charset=utf-8", body)
             return
@@ -532,9 +627,10 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         self._send_bytes(404, "text/plain; charset=utf-8", b"Not found\n")
 
-    def log_message(self, format: str, *args: Any) -> None:
-        if LOG_LEVEL == "DEBUG":
-            super().log_message(format, *args)
+    def log_message(self, fmt: str, *args: Any) -> None:
+        if logger.isEnabledFor(logging.DEBUG):
+            super().log_message(fmt, *args)
+
 
 # -----------------------------------------------------------------------------
 # Main
@@ -542,8 +638,11 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 collector_registered = False
 
+
 def handle_signal(signum, frame):
+    del signum, frame
     stop_event.set()
+
 
 def main() -> None:
     global collector_registered
@@ -562,14 +661,17 @@ def main() -> None:
 
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), RequestHandler)
 
-    print(f"Exporter listening on http://{LISTEN_HOST}:{LISTEN_PORT}", flush=True)
-    print(f"HWiNFO URL: {HWI_URL}", flush=True)
-    print("Endpoints: /metrics /healthz", flush=True)
+    logger.info("Exporter listening on http://%s:%s", LISTEN_HOST, LISTEN_PORT)
+    logger.info("HWiNFO URL: %s", HWI_URL)
+    logger.info("Endpoints: /metrics /healthz /readyz")
 
     try:
         server.serve_forever()
+    except Exception as exc:
+        logger.exception("HTTP server fatal error: %s", exc)
     finally:
         server.server_close()
+
 
 if __name__ == "__main__":
     main()
