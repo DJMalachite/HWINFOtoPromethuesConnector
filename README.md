@@ -10,7 +10,7 @@ A lightweight Prometheus exporter that converts hardware sensor data from HWiNFO
 
 This project allows you to monitor real-time hardware metrics from a Windows machine (CPU, GPU, memory, drives, etc.) using:
 
-* **HWiNFO + qdel's Remote Sensor Monitor (MyRSM)[https://github.com/qdel/myrsm]** as the data source
+* **HWiNFO + qdel's Remote Sensor Monitor [MyRSM](https://github.com/qdel/myrsm)** as the data source
 * **Prometheus** for scraping and storage
 * **Grafana** for visualisation
 
