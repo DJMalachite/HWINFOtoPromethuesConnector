@@ -92,14 +92,49 @@ hwinfo_sensor_value{sensor_name="Total CPU Usage"}
 
 Environment variables:
 
-| Variable        | Default                  | Description     |
-| --------------- | ------------------------ | --------------- |
-| `HWI_URL`       | `http://127.0.0.1:34567` | RSM endpoint    |
-| `LISTEN_HOST`   | `0.0.0.0`                | Bind address    |
-| `LISTEN_PORT`   | `10445`                  | Exporter port   |
-| `POLL_INTERVAL` | `1`                      | Poll frequency  |
-| `HTTP_TIMEOUT`  | `2`                      | Request timeout |
-| `EXPORTER_HOST` | system hostname          | Host label      |
+| Variable                 | Default                  | Description |
+| ------------------------ | ------------------------ | ----------- |
+| `HWI_URL`                | `http://127.0.0.1:34567` | RSM endpoint |
+| `LISTEN_HOST`            | `0.0.0.0`                | Bind address |
+| `LISTEN_PORT`            | `10445`                  | Exporter port |
+| `POLL_INTERVAL`          | `0.3`                    | Normal poll interval (seconds) while source is healthy |
+| `HTTP_TIMEOUT`           | `2`                      | HTTP timeout (seconds) for source requests |
+| `DOWN_RETRY_INTERVAL`    | `2`                      | Faster retry interval (seconds) while source is down |
+| `REQUEST_RETRIES`        | `1`                      | Number of request retries per poll cycle |
+| `DATA_FRESHNESS_TIMEOUT` | `20`                     | Data older than this is considered stale and sensor series are withheld |
+| `METRIC_PREFIX`          | `hwinfo`                 | Prefix for all exported metric names |
+| `EXPORTER_HOST`          | system hostname          | `host` label value for sensor metrics |
+| `LOG_LEVEL`              | `INFO`                   | Log level (`DEBUG`, `INFO`, etc.) |
+| `INCLUDE_SENSORS`        | (empty)                  | Comma-separated sensor-name substring allowlist |
+| `EXCLUDE_SENSORS`        | (empty)                  | Comma-separated sensor-name substring denylist |
+| `INCLUDE_CLASSES`        | (empty)                  | Comma-separated sensor-class substring allowlist |
+| `EXCLUDE_CLASSES`        | (empty)                  | Comma-separated sensor-class substring denylist |
+| `INCLUDE_APPS`           | (empty)                  | Comma-separated sensor-app substring allowlist |
+| `EXCLUDE_APPS`           | (empty)                  | Comma-separated sensor-app substring denylist |
+
+---
+
+## 🔀 Changes included from merged PRs
+
+Recent merges added operational and reliability improvements that are now reflected in this README:
+
+* **Stale metric protection:** when source data is older than `DATA_FRESHNESS_TIMEOUT`, sensor time series are omitted from `/metrics` to avoid exporting stale values.
+* **Health model update:** `hwinfo_exporter_up` now reflects **source reachability + data freshness** rather than just process liveness.
+* **Additional exporter health metrics:** source status, staleness, data age, poll timings, HTTP status, and poll counters are exported for alerting and troubleshooting.
+* **Source downtime behavior:** while down, the exporter uses `DOWN_RETRY_INTERVAL` for faster reconnect attempts.
+* **CI for Docker images:** GitHub Actions now supports CI build checks and GHCR publishing on `main` pushes and version tags.
+
+### New/important health metrics
+
+```
+hwinfo_exporter_up
+hwinfo_exporter_source_up
+hwinfo_exporter_stale
+hwinfo_exporter_data_age_seconds
+hwinfo_exporter_last_http_status
+hwinfo_exporter_successful_polls_total
+hwinfo_exporter_failed_polls_total
+```
 
 ---
 
@@ -204,5 +239,4 @@ MIT
 * HWiNFO
 * qdel MyRSM (Remote Sensor Monitor)
 * Prometheus ecosystem
-
 
