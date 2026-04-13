@@ -1,0 +1,17 @@
+services:
+  hwinfo-exporter:
+    build: .
+    container_name: hwinfo-exporter
+    restart: unless-stopped
+    ports:
+      - "10445:10445"
+    environment:
+      HWI_URL: "http://10.204.12.83:55555/"
+      EXPORTER_HOST: "dawinjessie"
+      LISTEN_HOST: "0.0.0.0"
+      LISTEN_PORT: "10445"
+      POLL_INTERVAL: "1"
+      HTTP_TIMEOUT: "1"
+      DOWN_RETRY_INTERVAL: "2"
+      LOG_LEVEL: "INFO"
+      EXCLUDE_SOURCES: "presentmon ["
