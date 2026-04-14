@@ -1,4 +1,4 @@
-Very much a vibe coded app, used to translate data from MyRSM to a scrapeable endpoint for prometheus
+### Disclaimer:  Very much a vibe coded app, needed something quick and easy to translate data from MyRSM to a scrapeable endpoint for prometheus and my own dashboards, if you find this and decide to use it please understand that it is ai made...
 
 # HWiNFO Prometheus Exporter
 
